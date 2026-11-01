@@ -1,0 +1,6 @@
+{
+  "name": "SplitByte — P2P Distributed Micro-Transformer Runtime",
+  "description": "Peer-to-peer split inference runtime for a 6-layer, 11.04M-parameter Byte-Level Micro-Transformer across two mobile browsers over WebRTC DataChannels on Web CPU.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
