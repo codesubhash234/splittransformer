@@ -5,8 +5,11 @@
  * 1. Direct raw binary messages (as described in the hackathon specification):
  *    - Phone 1 -> Phone 2: `Float32Array` buffer of Layer 2 activations
  *    - Phone 2 -> Phone 1: `Uint8Array([nextByte])` 1-byte token buffer
- * 2. Framed binary SCTP packets (for multi-chunk [1, 512, 384] tensors, KV-cache step synchronization,
- *    temperature synchronization, and latency/logit telemetry).
+ * 2. Framed binary SCTP packets:
+ *    - Single-step KV-cached FP32 `[1, 384]` (1,536 B payload)
+ *    - Coalesced Prompt Prefill Batch `[L, 384]` (1-trip prompt prefill)
+ *    - Dynamic Symmetric Int8 Quantized `[1, 384 Int8 + FP32 Scale]` (388 B payload — 75% bandwidth reduction)
+ *    - Multi-chunk SCTP `[1, T, 384]` full-sequence tensor transport
  */
 
 export const PACKET_MAGIC = 0x5342; // 'SB' (SplitByte)
@@ -19,20 +22,32 @@ export enum PacketType {
   TOKEN_RESULT = 0x04, // Next byte [0..255] + optional top-5 logits & Node B compute ms
   PING = 0x05,
   PONG = 0x06,
+  REMOTE_START_REQUEST = 0x07, // Phone 2 requests Phone 1 to start split inference
+  PREFILL_BATCH = 0x08, // Coalesced multi-position prompt prefill [count, 384] Float32 activations
+  ACTIVATION_STEP_INT8 = 0x09, // Dynamic symmetric Int8 quantized [1, 384] activation + FP32 scale (404 B total)
 }
 
 export interface DecodedActivationStep {
   type: PacketType.ACTIVATION_STEP;
   stepId: number;
   seqPos: number;
+  inputByte: number;
   temperature: number;
+  wireBytes: number;
   activations: Float32Array; // [384]
+}
+
+export interface DecodedPrefillBatch {
+  type: PacketType.PREFILL_BATCH;
+  count: number;
+  activations: Float32Array; // [count * 384]
 }
 
 export interface DecodedActivationFull {
   type: PacketType.ACTIVATION_CHUNK;
   stepId: number;
   seqLen: number;
+  inputByte: number;
   temperature: number;
   activations: Float32Array; // [seqLen * 384] or [512 * 384]
 }
@@ -49,6 +64,12 @@ export interface DecodedTokenResult {
 export interface DecodedResetSession {
   type: PacketType.RESET_SESSION;
   sessionId: number;
+  targetNewBytes: number;
+  promptBytes: number[];
+}
+
+export interface DecodedRemoteStartRequest {
+  type: PacketType.REMOTE_START_REQUEST;
 }
 
 export interface DecodedPingPong {
@@ -58,9 +79,11 @@ export interface DecodedPingPong {
 
 export type DecodedPacket =
   | DecodedActivationStep
+  | DecodedPrefillBatch
   | DecodedActivationFull
   | DecodedTokenResult
   | DecodedResetSession
+  | DecodedRemoteStartRequest
   | DecodedPingPong;
 
 /**
@@ -71,7 +94,8 @@ export function encodeActivationStepPacket(
   stepId: number,
   seqPos: number,
   temperature: number,
-  activations: Float32Array
+  activations: Float32Array,
+  inputByte = 0
 ): ArrayBuffer {
   const headerBytes = 16;
   const payloadBytes = activations.byteLength;
@@ -80,13 +104,74 @@ export function encodeActivationStepPacket(
 
   view.setUint16(0, PACKET_MAGIC, true);
   view.setUint8(2, PacketType.ACTIVATION_STEP);
-  view.setUint8(3, 0); // reserved
+  view.setUint8(3, inputByte & 0xff);
   view.setUint32(4, stepId >>> 0, true);
   view.setUint32(8, seqPos >>> 0, true);
   view.setFloat32(12, temperature, true);
 
   const floatDest = new Float32Array(buf, headerBytes, activations.length);
   floatDest.set(activations);
+  return buf;
+}
+
+/**
+ * Encode a single-step Layer 2 activation tensor [384] using Dynamic Symmetric Int8 Quantization:
+ * - 20-byte header (includes 4-byte FP32 dequantization scale) + 384 bytes Int8 payload = 404 bytes total!
+ * - Cuts wireless DataChannel payload size by 74% (388 B vs 1,536 B).
+ */
+export function encodeActivationStepInt8Packet(
+  stepId: number,
+  seqPos: number,
+  temperature: number,
+  activations: Float32Array,
+  inputByte = 0
+): ArrayBuffer {
+  const len = activations.length; // 384
+  let maxAbs = 1e-8;
+  for (let i = 0; i < len; i++) {
+    const a = Math.abs(activations[i]);
+    if (a > maxAbs) maxAbs = a;
+  }
+  const scale = maxAbs / 127.0;
+  const invScale = 127.0 / maxAbs;
+
+  const headerBytes = 20;
+  const buf = new ArrayBuffer(headerBytes + len);
+  const view = new DataView(buf);
+
+  view.setUint16(0, PACKET_MAGIC, true);
+  view.setUint8(2, PacketType.ACTIVATION_STEP_INT8);
+  view.setUint8(3, inputByte & 0xff);
+  view.setUint32(4, stepId >>> 0, true);
+  view.setUint32(8, seqPos >>> 0, true);
+  view.setFloat32(12, temperature, true);
+  view.setFloat32(16, scale, true);
+
+  const int8Dest = new Int8Array(buf, headerBytes, len);
+  for (let i = 0; i < len; i++) {
+    int8Dest[i] = Math.max(-127, Math.min(127, Math.round(activations[i] * invScale)));
+  }
+  return buf;
+}
+
+/**
+ * Coalesce all prompt prefill activations `0 .. count-1` into a single binary packet
+ * so Phone 1 -> Phone 2 prefill happens in 1 DataChannel message instead of `count` round-trips.
+ */
+export function encodePrefillBatchPacket(
+  count: number,
+  activations: Float32Array
+): ArrayBuffer {
+  const headerBytes = 8;
+  const buf = new ArrayBuffer(headerBytes + activations.byteLength);
+  const view = new DataView(buf);
+
+  view.setUint16(0, PACKET_MAGIC, true);
+  view.setUint8(2, PacketType.PREFILL_BATCH);
+  view.setUint8(3, 0);
+  view.setUint32(4, count >>> 0, true);
+
+  new Float32Array(buf, headerBytes, activations.length).set(activations);
   return buf;
 }
 
@@ -98,7 +183,8 @@ export function encodeActivationFullChunks(
   stepId: number,
   seqLen: number,
   temperature: number,
-  activations: Float32Array
+  activations: Float32Array,
+  inputByte = 0
 ): ArrayBuffer[] {
   const rawBytes = new Uint8Array(
     activations.buffer,
@@ -119,7 +205,7 @@ export function encodeActivationFullChunks(
 
     view.setUint16(0, PACKET_MAGIC, true);
     view.setUint8(2, PacketType.ACTIVATION_CHUNK);
-    view.setUint8(3, 0);
+    view.setUint8(3, inputByte & 0xff);
     view.setUint32(4, stepId >>> 0, true);
     view.setUint16(8, seqLen, true);
     view.setUint16(10, totalChunks, true);
@@ -176,26 +262,42 @@ export function encodeTokenResultPacket(
   return buf;
 }
 
-export function encodeResetSessionPacket(sessionId: number): ArrayBuffer {
-  const buf = new ArrayBuffer(8);
+export function encodeResetSessionPacket(
+  sessionId: number,
+  promptBytes: number[] = [],
+  targetNewBytes = 16
+): ArrayBuffer {
+  const headerBytes = 12;
+  const buf = new ArrayBuffer(headerBytes + promptBytes.length);
   const view = new DataView(buf);
   view.setUint16(0, PACKET_MAGIC, true);
   view.setUint8(2, PacketType.RESET_SESSION);
-  view.setUint8(3, 0);
+  view.setUint8(3, targetNewBytes & 0xff);
   view.setUint32(4, sessionId >>> 0, true);
+  view.setUint32(8, promptBytes.length >>> 0, true);
+  const u8 = new Uint8Array(buf, headerBytes, promptBytes.length);
+  for (let i = 0; i < promptBytes.length; i++) {
+    u8[i] = promptBytes[i] & 0xff;
+  }
+  return buf;
+}
+
+export function encodeRemoteStartRequestPacket(): ArrayBuffer {
+  const buf = new ArrayBuffer(4);
+  const view = new DataView(buf);
+  view.setUint16(0, PACKET_MAGIC, true);
+  view.setUint8(2, PacketType.REMOTE_START_REQUEST);
+  view.setUint8(3, 0);
   return buf;
 }
 
 /**
  * Reassembler and decoder for incoming RTCDataChannel binary ArrayBuffers.
- * Automatically handles:
- * - Raw 1-byte Uint8Array([nextByte]) token packets
- * - Raw unframed Float32Array activation buffers (e.g. 384 floats = 1,536 bytes or 512*384 floats)
- * - Framed SplitByte protocol packets and multi-chunk activation reassembly
  */
 export class DataChannelPacketAssembler {
   private pendingStepId = -1;
   private pendingSeqLen = 0;
+  private pendingInputByte = 0;
   private pendingTemp = 0.0;
   private pendingTotalChunks = 0;
   private pendingReceivedChunks = 0;
@@ -226,7 +328,9 @@ export class DataChannelPacketAssembler {
           type: PacketType.ACTIVATION_STEP,
           stepId: 0,
           seqPos: 0,
+          inputByte: 0,
           temperature: 0.0,
+          wireBytes: buffer.byteLength,
           activations: floats,
         };
       }
@@ -234,6 +338,7 @@ export class DataChannelPacketAssembler {
         type: PacketType.ACTIVATION_CHUNK,
         stepId: 0,
         seqLen: Math.floor(floats.length / 384),
+        inputByte: 0,
         temperature: 0.0,
         activations: floats,
       };
@@ -242,14 +347,41 @@ export class DataChannelPacketAssembler {
     const pktType = view.getUint8(2) as PacketType;
 
     switch (pktType) {
+      case PacketType.REMOTE_START_REQUEST: {
+        return { type: PacketType.REMOTE_START_REQUEST };
+      }
+
       case PacketType.RESET_SESSION: {
+        const targetNewBytes = view.getUint8(3) || 16;
+        const sessionId = view.getUint32(4, true);
+        const promptLen = buffer.byteLength >= 12 ? view.getUint32(8, true) : 0;
+        const promptBytes: number[] = [];
+        if (promptLen > 0 && buffer.byteLength >= 12 + promptLen) {
+          const u8 = new Uint8Array(buffer, 12, promptLen);
+          for (let i = 0; i < promptLen; i++) promptBytes.push(u8[i]);
+        }
         return {
           type: PacketType.RESET_SESSION,
-          sessionId: view.getUint32(4, true),
+          sessionId,
+          targetNewBytes,
+          promptBytes,
+        };
+      }
+
+      case PacketType.PREFILL_BATCH: {
+        const count = view.getUint32(4, true);
+        const floatLen = (buffer.byteLength - 8) / 4;
+        const activations = new Float32Array(floatLen);
+        activations.set(new Float32Array(buffer, 8, floatLen));
+        return {
+          type: PacketType.PREFILL_BATCH,
+          count,
+          activations,
         };
       }
 
       case PacketType.ACTIVATION_STEP: {
+        const inputByte = view.getUint8(3);
         const stepId = view.getUint32(4, true);
         const seqPos = view.getUint32(8, true);
         const temperature = view.getFloat32(12, true);
@@ -260,12 +392,38 @@ export class DataChannelPacketAssembler {
           type: PacketType.ACTIVATION_STEP,
           stepId,
           seqPos,
+          inputByte,
           temperature,
+          wireBytes: buffer.byteLength - 16,
+          activations,
+        };
+      }
+
+      case PacketType.ACTIVATION_STEP_INT8: {
+        const inputByte = view.getUint8(3);
+        const stepId = view.getUint32(4, true);
+        const seqPos = view.getUint32(8, true);
+        const temperature = view.getFloat32(12, true);
+        const scale = view.getFloat32(16, true);
+        const len = buffer.byteLength - 20;
+        const int8View = new Int8Array(buffer, 20, len);
+        const activations = new Float32Array(len);
+        for (let i = 0; i < len; i++) {
+          activations[i] = Math.fround(int8View[i] * scale);
+        }
+        return {
+          type: PacketType.ACTIVATION_STEP,
+          stepId,
+          seqPos,
+          inputByte,
+          temperature,
+          wireBytes: len + 4, // 388 B (384 Int8 + 4B scale)
           activations,
         };
       }
 
       case PacketType.ACTIVATION_CHUNK: {
+        const inputByte = view.getUint8(3);
         const stepId = view.getUint32(4, true);
         const seqLen = view.getUint16(8, true);
         const totalChunks = view.getUint16(10, true);
@@ -276,6 +434,7 @@ export class DataChannelPacketAssembler {
         if (this.pendingStepId !== stepId || !this.pendingBuffer) {
           this.pendingStepId = stepId;
           this.pendingSeqLen = seqLen;
+          this.pendingInputByte = inputByte;
           this.pendingTemp = temperature;
           this.pendingTotalChunks = totalChunks;
           this.pendingReceivedChunks = 0;
@@ -297,6 +456,7 @@ export class DataChannelPacketAssembler {
             type: PacketType.ACTIVATION_CHUNK,
             stepId,
             seqLen: this.pendingSeqLen,
+            inputByte: this.pendingInputByte,
             temperature: this.pendingTemp,
             activations: completedFloats,
           };

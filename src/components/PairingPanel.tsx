@@ -30,7 +30,12 @@ export const PairingPanel: React.FC<PairingPanelProps> = ({
   onDisconnect,
 }) => {
   const [offerToken, setOfferToken] = useState('');
-  const [remoteOfferInput, setRemoteOfferInput] = useState('');
+  const [remoteOfferInput, setRemoteOfferInput] = useState(() => {
+    if (typeof window !== 'undefined' && window.location.hash.startsWith('#offer=')) {
+      return decodeURIComponent(window.location.hash.slice(7));
+    }
+    return '';
+  });
   const [answerToken, setAnswerToken] = useState('');
   const [remoteAnswerInput, setRemoteAnswerInput] = useState('');
   const [roomCode, setRoomCode] = useState('4242');
@@ -249,13 +254,27 @@ export const PairingPanel: React.FC<PairingPanelProps> = ({
                         Generate SDP Offer
                       </button>
                       {offerToken && (
-                        <button
-                          type="button"
-                          onClick={() => handleCopy(offerToken, 'offer')}
-                          className="px-3 py-1.5 rounded border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 text-xs font-mono transition-colors whitespace-nowrap shrink-0"
-                        >
-                          {copiedLabel === 'offer' ? 'Copied Offer' : 'Copy Offer Token'}
-                        </button>
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => handleCopy(offerToken, 'offer')}
+                            className="px-3 py-1.5 rounded border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 text-xs font-mono transition-colors whitespace-nowrap shrink-0"
+                          >
+                            {copiedLabel === 'offer' ? 'Copied Offer' : 'Copy Offer Token'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCopy(
+                                `${window.location.origin}${window.location.pathname}#offer=${encodeURIComponent(offerToken)}`,
+                                'join-link'
+                              )
+                            }
+                            className="px-3 py-1.5 rounded border border-cyan-500/50 bg-cyan-950/30 hover:bg-cyan-900/40 text-cyan-200 text-xs font-mono transition-colors whitespace-nowrap shrink-0"
+                          >
+                            {copiedLabel === 'join-link' ? 'Copied Link' : 'Copy Phone 2 Link'}
+                          </button>
+                        </>
                       )}
                     </div>
                   </div>

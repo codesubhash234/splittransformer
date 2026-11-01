@@ -17,7 +17,7 @@ interface PipelineVisualizerProps {
   stats: DataChannelStats;
   shardAChecksum: string;
   shardBChecksum: string;
-  transferMode: 'kv-step' | 'full-sequence' | 'raw-1byte';
+  transferMode: 'kv-step' | 'kv-int8' | 'full-sequence' | 'raw-1byte';
 }
 
 export const PipelineVisualizer: React.FC<PipelineVisualizerProps> = ({
@@ -152,11 +152,21 @@ export const PipelineVisualizer: React.FC<PipelineVisualizerProps> = ({
                 <div className="flex items-center justify-between text-[11px] font-mono">
                   <span className="text-slate-300">Layer 2 Activations →</span>
                   <span className="text-cyan-300 tabular-nums">
-                    {transferMode === 'kv-step' ? '1,536 B' : `${(( currentPos || 1) * 384 * 4).toLocaleString()} B`}
+                    {transferMode === 'kv-int8'
+                      ? '388 B (Int8)'
+                      : transferMode === 'kv-step' || transferMode === 'raw-1byte'
+                      ? '1,536 B'
+                      : `${((currentPos || 1) * 384 * 4).toLocaleString()} B`}
                   </span>
                 </div>
                 <div className="text-[11px] font-mono text-slate-400 mt-1 tabular-nums">
-                  Float32Array [{transferMode === 'kv-step' ? '1 × 384' : `1 × ${Math.max(1, currentPos)} × 384`}]
+                  {transferMode === 'kv-int8'
+                    ? 'Int8Array [1 × 384] + FP32 scale'
+                    : `Float32Array [${
+                        transferMode === 'kv-step' || transferMode === 'raw-1byte'
+                          ? '1 × 384'
+                          : `1 × ${Math.max(1, currentPos)} × 384`
+                      }]`}
                 </div>
               </div>
 

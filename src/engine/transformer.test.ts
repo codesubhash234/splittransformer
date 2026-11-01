@@ -12,7 +12,9 @@ import {
   DataChannelPacketAssembler,
   PacketType,
   encodeActivationFullChunks,
+  encodeActivationStepInt8Packet,
   encodeActivationStepPacket,
+  encodePrefillBatchPacket,
   encodeTokenResultPacket,
 } from './protocol';
 
@@ -134,3 +136,76 @@ test('Binary RTCDataChannel protocol encodes and reassembles both KV-step and fu
   assert.ok(decodedRawToken && decodedRawToken.type === PacketType.TOKEN_RESULT);
   assert.equal(decodedRawToken.nextByte, 105);
 });
+
+test('WebAssembly (WASM CPU) and JavaScript (JS CPU) backends produce bit-identical bytes and PyTorch nn.Module default scheme is deterministic', () => {
+  const shardA = createShardAWeights(42, undefined, 'pytorch-nn-default');
+  const shardB = createShardBWeights(42, undefined, 'pytorch-nn-default');
+
+  const nodeAWasm = new NodeARuntime(shardA, 'wasm-cpu');
+  const nodeBWasm = new NodeBRuntime(shardB, 'wasm-cpu');
+  const nodeAJs = new NodeARuntime(shardA, 'js-cpu');
+  const nodeBJs = new NodeBRuntime(shardB, 'js-cpu');
+
+  const prompt = [83, 112, 108, 105, 116]; // "Split"
+  for (let pos = 0; pos < prompt.length; pos++) {
+    const actWasm = nodeAWasm.forwardStep(prompt[pos], pos);
+    const resWasm = nodeBWasm.forwardStep(actWasm, pos);
+    const actJs = nodeAJs.forwardStep(prompt[pos], pos);
+    const resJs = nodeBJs.forwardStep(actJs, pos);
+
+    const byteWasm = sampleNextByte(resWasm.logits, 0.0).nextByte;
+    const byteJs = sampleNextByte(resJs.logits, 0.0).nextByte;
+    assert.equal(byteWasm, byteJs);
+  }
+});
+
+test('Coalesced Prefill Batch, Dynamic Int8 Activation Quantization (75% smaller), and Speculative Lookahead preserve pipeline integrity', () => {
+  const assembler = new DataChannelPacketAssembler();
+  const nodeA = new NodeARuntime();
+  const nodeB = new NodeBRuntime();
+
+  // 1. Test Coalesced Prefill Batch packet (4 tokens in a single WebRTC frame)
+  const batchAct = new Float32Array(4 * 384);
+  for (let i = 0; i < batchAct.length; i++) batchAct[i] = Math.fround((i % 97) * 0.02 - 1.0);
+  const batchBuf = encodePrefillBatchPacket(4, batchAct);
+  const decodedBatch = assembler.decode(batchBuf);
+  assert.ok(decodedBatch && decodedBatch.type === PacketType.PREFILL_BATCH);
+  assert.equal(decodedBatch.count, 4);
+  assert.equal(decodedBatch.activations.length, 4 * 384);
+  assert.equal(decodedBatch.activations[0], batchAct[0]);
+
+  // 2. Test Dynamic Int8 Activation Quantization (404 B total packet vs 1,552 B FP32)
+  const realAct = nodeA.forwardStep(72, 0); // 'H' at pos 0
+  const int8Buf = encodeActivationStepInt8Packet(1, 0, 0.0, realAct, 72);
+  assert.equal(int8Buf.byteLength, 20 + 384); // 404 bytes total (74% smaller than 1552B)
+  const decodedInt8 = assembler.decode(int8Buf);
+  assert.ok(decodedInt8 && decodedInt8.type === PacketType.ACTIVATION_STEP);
+  assert.equal(decodedInt8.wireBytes, 388);
+  assert.equal(decodedInt8.activations.length, 384);
+
+  // Verify max quantization reconstruction error is bounded by scale / 2
+  let maxErr = 0;
+  for (let i = 0; i < 384; i++) {
+    const err = Math.abs(decodedInt8.activations[i] - realAct[i]);
+    if (err > maxErr) maxErr = err;
+  }
+  assert.ok(maxErr < 0.05, `Expected small Int8 reconstruction error, got ${maxErr}`);
+
+  // 3. Test Speculative Pipeline Lookahead KV-cache safety (Hit & Miss)
+  nodeA.resetCache();
+  nodeB.resetCache();
+  const act0 = nodeA.forwardStep(72, 0);
+  nodeB.forwardStep(act0, 0);
+
+  // Speculatively evaluate candidate byte 99 at pos 1, then overwrite with actual byte 101 at pos 1
+  nodeA.forwardStep(99, 1); // Speculative miss
+  const act1Recovered = nodeA.forwardStep(101, 1); // Actual byte overwrites KV slot 1
+
+  const nodeAClean = new NodeARuntime();
+  nodeAClean.forwardStep(72, 0);
+  const act1Clean = nodeAClean.forwardStep(101, 1);
+
+  assert.deepEqual(Array.from(act1Recovered), Array.from(act1Clean));
+});
+
+

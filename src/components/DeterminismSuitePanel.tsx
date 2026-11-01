@@ -7,6 +7,7 @@ import {
   sampleNextByte,
   formatByteGlyph,
 } from '../engine/transformer';
+import { getWasmCpuKernel } from '../engine/wasmKernel';
 
 interface DeterminismSuitePanelProps {
   shardA: ShardAWeights;
@@ -18,6 +19,7 @@ interface BenchmarkStepRecord {
   pos: number;
   kvByte: number;
   fullSeqByte: number;
+  wasmByte: number;
   kvLogitMax: number;
   fullSeqLogitMax: number;
   maxAbsDelta: number;
@@ -39,6 +41,7 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
     bytesPerSec: number;
     maxDelta: number;
     byteSequenceHex: string;
+    wasmActive: boolean;
   } | null>(null);
 
   const runVerificationSuite = () => {
@@ -47,15 +50,21 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
       const encoder = new TextEncoder();
       const promptBytes = Array.from(encoder.encode(testPrompt || 'A'));
 
-      // Run 1: KV-Cached Split Execution (Node A -> Node B)
-      const nodeAKv = new NodeARuntime(shardA);
-      const nodeBKv = new NodeBRuntime(shardB);
-      nodeAKv.resetCache();
-      nodeBKv.resetCache();
+      // Run 1: KV-Cached Split Execution with WebAssembly CPU Kernel
+      const nodeAKvWasm = new NodeARuntime(shardA, 'wasm-cpu');
+      const nodeBKvWasm = new NodeBRuntime(shardB, 'wasm-cpu');
+      nodeAKvWasm.resetCache();
+      nodeBKvWasm.resetCache();
 
-      // Run 2: Full-Sequence [1, T, 384] Recomputed Split Execution
-      const nodeAFull = new NodeARuntime(shardA);
-      const nodeBFull = new NodeBRuntime(shardB);
+      // Run 2: KV-Cached Split Execution with Pure JS 4x-Unrolled CPU Kernel
+      const nodeAKvJs = new NodeARuntime(shardA, 'js-cpu');
+      const nodeBKvJs = new NodeBRuntime(shardB, 'js-cpu');
+      nodeAKvJs.resetCache();
+      nodeBKvJs.resetCache();
+
+      // Run 3: Full-Sequence [1, T, 384] Recomputed Split Execution
+      const nodeAFull = new NodeARuntime(shardA, 'wasm-cpu');
+      const nodeBFull = new NodeBRuntime(shardB, 'wasm-cpu');
 
       const seqKv = [...promptBytes];
       const seqFull = [...promptBytes];
@@ -65,8 +74,10 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
 
       // Prefill KV cache up to promptBytes.length - 1
       for (let i = 0; i < promptBytes.length - 1; i++) {
-        const act = nodeAKv.forwardStep(seqKv[i], i);
-        nodeBKv.forwardStep(act, i);
+        const actW = nodeAKvWasm.forwardStep(seqKv[i], i);
+        nodeBKvWasm.forwardStep(actW, i);
+        const actJ = nodeAKvJs.forwardStep(seqKv[i], i);
+        nodeBKvJs.forwardStep(actJ, i);
       }
 
       let worstDelta = 0;
@@ -77,13 +88,18 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
         const inputByte = seqKv[pos];
 
         const tA0 = performance.now();
-        const actKv = nodeAKv.forwardStep(inputByte, pos);
+        const actKvWasm = nodeAKvWasm.forwardStep(inputByte, pos);
         const tA1 = performance.now();
 
-        const resKv = nodeBKv.forwardStep(actKv, pos);
+        const resKvWasm = nodeBKvWasm.forwardStep(actKvWasm, pos);
         const tB1 = performance.now();
 
-        const sampledKv = sampleNextByte(resKv.logits, 0.0);
+        const sampledWasm = sampleNextByte(resKvWasm.logits, 0.0);
+
+        // JS CPU pass
+        const actKvJs = nodeAKvJs.forwardStep(inputByte, pos);
+        const resKvJs = nodeBKvJs.forwardStep(actKvJs, pos);
+        const sampledJs = sampleNextByte(resKvJs.logits, 0.0);
 
         // Full-sequence evaluation on `seqFull`
         const actFull = nodeAFull.forwardFullSequence(seqFull, false);
@@ -92,35 +108,44 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
 
         let maxAbsDelta = 0;
         for (let v = 0; v < 256; v++) {
-          const d = Math.abs(resKv.logits[v] - resFull.logits[v]);
+          const d = Math.max(
+            Math.abs(resKvWasm.logits[v] - resFull.logits[v]),
+            Math.abs(resKvWasm.logits[v] - resKvJs.logits[v])
+          );
           if (d > maxAbsDelta) maxAbsDelta = d;
         }
         if (maxAbsDelta > worstDelta) worstDelta = maxAbsDelta;
-        if (sampledKv.nextByte !== sampledFull.nextByte) {
+        if (
+          sampledWasm.nextByte !== sampledFull.nextByte ||
+          sampledWasm.nextByte !== sampledJs.nextByte
+        ) {
           allMatched = false;
         }
 
         stepRecords.push({
           step: step + 1,
           pos,
-          kvByte: sampledKv.nextByte,
+          kvByte: sampledJs.nextByte,
           fullSeqByte: sampledFull.nextByte,
-          kvLogitMax: sampledKv.topK[0].logit,
+          wasmByte: sampledWasm.nextByte,
+          kvLogitMax: sampledWasm.topK[0].logit,
           fullSeqLogitMax: sampledFull.topK[0].logit,
           maxAbsDelta,
           nodeAMs: tA1 - tA0,
           nodeBMs: tB1 - tA1,
         });
 
-        seqKv.push(sampledKv.nextByte);
+        seqKv.push(sampledWasm.nextByte);
         seqFull.push(sampledFull.nextByte);
       }
 
       const totalMs = performance.now() - tStart;
-      const generatedBytes = stepRecords.map((r) => r.kvByte);
+      const generatedBytes = stepRecords.map((r) => r.wasmByte);
       const byteSequenceHex = generatedBytes
         .map((b) => '0x' + b.toString(16).toUpperCase().padStart(2, '0'))
         .join(' ');
+
+      const wasmInfo = getWasmCpuKernel();
 
       setRecords(stepRecords);
       setSummary({
@@ -129,6 +154,7 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
         bytesPerSec: (numBytesToVerify / Math.max(1, totalMs)) * 1000,
         maxDelta: worstDelta,
         byteSequenceHex,
+        wasmActive: wasmInfo.isSupported,
       });
       setIsRunning(false);
     }, 20);
@@ -140,10 +166,10 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
         <div className="flex flex-wrap items-center justify-between gap-4 pb-4 mb-5 border-b border-slate-800">
           <div>
             <h2 className="text-base font-semibold text-slate-100">
-              Seed 42 Determinism &amp; Mathematical Equivalence Suite (Temperature = 0.0)
+              Seed 42 Determinism &amp; WebAssembly / Full-Sequence Equivalence Suite (Temperature = 0.0)
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Verifies that KV-Cached Split Execution and Full-Sequence [1 × T × 384] Split Execution yield identical deterministic byte sequences
+              Verifies that WebAssembly (WASM CPU), 4x-Unrolled JS CPU, and Full-Sequence [1 × T × 384] Split Execution yield identical deterministic byte sequences
             </p>
           </div>
           <button
@@ -198,7 +224,7 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className={summary.passed ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold'}>
                 {summary.passed
-                  ? '● DETERMINISM VERIFIED: 100% Byte & Logit Equivalence Across Split Shards'
+                  ? '● DETERMINISM VERIFIED: 100% Byte & Logit Equivalence (WASM CPU == JS CPU == Full-Sequence Split)'
                   : '✖ MISMATCH DETECTED'}
               </span>
               <span className="text-slate-300">
@@ -213,7 +239,7 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
 
         {records.length === 0 ? (
           <div className="py-10 text-center border border-dashed border-slate-800 rounded-lg text-xs font-mono text-slate-400">
-            Click &quot;Run Determinism Benchmark&quot; to execute parallel KV-Cached and Full-Sequence split inference passes.
+            Click &quot;Run Determinism Benchmark&quot; to execute parallel WebAssembly CPU, JS CPU, and Full-Sequence split inference passes.
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -222,7 +248,8 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
                 <tr className="border-b border-slate-800 text-slate-400">
                   <th className="py-2 px-3">Step</th>
                   <th className="py-2 px-3">Seq Pos</th>
-                  <th className="py-2 px-3">KV-Step Byte</th>
+                  <th className="py-2 px-3">WASM CPU Byte</th>
+                  <th className="py-2 px-3">JS CPU Byte</th>
                   <th className="py-2 px-3">Full-Tensor [1×T×384] Byte</th>
                   <th className="py-2 px-3 text-right">Max Logit</th>
                   <th className="py-2 px-3 text-right">Logit Δ</th>
@@ -235,6 +262,9 @@ export const DeterminismSuitePanel: React.FC<DeterminismSuitePanelProps> = ({
                   <tr key={rec.step} className="hover:bg-slate-900/50">
                     <td className="py-2 px-3 text-slate-400">#{rec.step}</td>
                     <td className="py-2 px-3">{rec.pos}</td>
+                    <td className="py-2 px-3 text-emerald-400 font-semibold">
+                      {rec.wasmByte} ({formatByteGlyph(rec.wasmByte)})
+                    </td>
                     <td className="py-2 px-3 text-cyan-300">
                       {rec.kvByte} ({formatByteGlyph(rec.kvByte)})
                     </td>

@@ -11,6 +11,10 @@
  */
 
 import { TorchMT19937, computeTensorChecksum } from './prng';
+import { getWasmCpuKernel } from './wasmKernel';
+
+export type WeightInitScheme = 'box-muller-seed42' | 'pytorch-nn-default';
+export type ComputeBackend = 'wasm-cpu' | 'js-cpu';
 
 export const MODEL_SPEC = {
   vocabSize: 256,
@@ -35,6 +39,9 @@ export const MODEL_SPEC = {
   totalBytesFp32: 44_163_072, // 11,040,768 * 4
   shardABytesFp32: 22_473_216, // 5,618,304 * 4
   shardBBytesFp32: 21_689_856, // 5,422,464 * 4
+  // In PyTorch nn.Module default init, LayerNorm uses ones_()/zeros_() (0 PRNG draws per LN).
+  // Thus each layer consumes 1,774,464 - 1,536 = 1,772,928 PRNG draws.
+  shardAPyTorchDefaultDraws: 256 * 384 + 512 * 384 + 3 * (1_774_464 - 1_536), // 5,613,696
 } as const;
 
 export interface TransformerLayerWeights {
@@ -59,6 +66,7 @@ export interface TransformerLayerWeights {
 
 export interface ShardAWeights {
   role: 'node-a';
+  scheme: WeightInitScheme | 'external-bin';
   rawBuffer: Float32Array; // Length: 5,618,304
   checksum: string;
   tokEmb: Float32Array; // [256, 384] = 98,304
@@ -68,6 +76,7 @@ export interface ShardAWeights {
 
 export interface ShardBWeights {
   role: 'node-b';
+  scheme: WeightInitScheme | 'external-bin';
   rawBuffer: Float32Array; // Length: 5,422,464
   checksum: string;
   layers: [TransformerLayerWeights, TransformerLayerWeights, TransformerLayerWeights]; // Layers 3, 4, 5
@@ -143,12 +152,9 @@ function bindLayerViews(
 }
 
 /**
- * Populate a layer's weights using the deterministic seed-42 PRNG.
- * To match standard PyTorch module initialization with `torch.manual_seed(42)`,
- * every parameter slot consumes one normal sample from the PRNG, with LayerNorm
- * scale weights centered around 1.0 and biases scaled by 0.01.
+ * Scheme 1: GPT-2 Box-Muller Normal initialization (`torch.manual_seed(42)` + true Box-Muller N(0, 0.02))
  */
-function initLayerWithPrng(layer: TransformerLayerWeights, prng: TorchMT19937): void {
+function initLayerWithBoxMuller(layer: TransformerLayerWeights, prng: TorchMT19937): void {
   const fillCentered = (arr: Float32Array, mean: number, std: number) => {
     for (let i = 0; i < arr.length; i++) {
       arr[i] = prng.nextNormal(mean, std);
@@ -174,12 +180,47 @@ function initLayerWithPrng(layer: TransformerLayerWeights, prng: TorchMT19937): 
 }
 
 /**
+ * Scheme 2: Exact PyTorch `nn.Module` default initialization (`nn.LayerNorm` ones/zeros + `nn.Linear` Kaiming Uniform)
+ * Follows exact `model.named_parameters()` registration order:
+ * - `ln_1.weight` = 1.0, `ln_1.bias` = 0.0 (0 PRNG draws)
+ * - `q_proj`, `k_proj`, `v_proj`, `out_proj`: Uniform(-1/sqrt(384), +1/sqrt(384))
+ * - `ln_2.weight` = 1.0, `ln_2.bias` = 0.0 (0 PRNG draws)
+ * - `fc1`: Uniform(-1/sqrt(384), +1/sqrt(384))
+ * - `fc2`: Uniform(-1/sqrt(1536), +1/sqrt(1536))
+ */
+function initLayerWithPyTorchDefault(layer: TransformerLayerWeights, prng: TorchMT19937): void {
+  const bound384 = 1.0 / Math.sqrt(MODEL_SPEC.dModel);
+  const bound1536 = 1.0 / Math.sqrt(MODEL_SPEC.dFf);
+
+  layer.ln1Weight.fill(1.0);
+  layer.ln1Bias.fill(0.0);
+
+  prng.fillUniform(layer.qWeight, bound384);
+  prng.fillUniform(layer.qBias, bound384);
+  prng.fillUniform(layer.kWeight, bound384);
+  prng.fillUniform(layer.kBias, bound384);
+  prng.fillUniform(layer.vWeight, bound384);
+  prng.fillUniform(layer.vBias, bound384);
+  prng.fillUniform(layer.outWeight, bound384);
+  prng.fillUniform(layer.outBias, bound384);
+
+  layer.ln2Weight.fill(1.0);
+  layer.ln2Bias.fill(0.0);
+
+  prng.fillUniform(layer.fc1Weight, bound384);
+  prng.fillUniform(layer.fc1Bias, bound384);
+  prng.fillUniform(layer.fc2Weight, bound1536);
+  prng.fillUniform(layer.fc2Bias, bound1536);
+}
+
+/**
  * Initialize Shard A (Phone 1: Embeddings + Layers 0..2 = 5,618,304 FP32 parameters)
  * Either from deterministic PyTorch Seed 42 PRNG or from an external binary buffer.
  */
 export function createShardAWeights(
   seed = MODEL_SPEC.seed,
-  externalBuffer?: Float32Array
+  externalBuffer?: Float32Array,
+  scheme: WeightInitScheme = 'box-muller-seed42'
 ): ShardAWeights {
   const rawBuffer =
     externalBuffer && externalBuffer.length === MODEL_SPEC.shardAParams
@@ -198,15 +239,25 @@ export function createShardAWeights(
 
   if (!externalBuffer) {
     const prng = new TorchMT19937(seed);
-    prng.fillNormal(tokEmb, 0.02);
-    prng.fillNormal(posEmb, 0.02);
-    initLayerWithPrng(l0.layer, prng);
-    initLayerWithPrng(l1.layer, prng);
-    initLayerWithPrng(l2.layer, prng);
+    if (scheme === 'pytorch-nn-default') {
+      // PyTorch nn.Embedding uses N(0, 1)
+      prng.fillNormal(tokEmb, 1.0);
+      prng.fillNormal(posEmb, 1.0);
+      initLayerWithPyTorchDefault(l0.layer, prng);
+      initLayerWithPyTorchDefault(l1.layer, prng);
+      initLayerWithPyTorchDefault(l2.layer, prng);
+    } else {
+      prng.fillNormal(tokEmb, 0.02);
+      prng.fillNormal(posEmb, 0.02);
+      initLayerWithBoxMuller(l0.layer, prng);
+      initLayerWithBoxMuller(l1.layer, prng);
+      initLayerWithBoxMuller(l2.layer, prng);
+    }
   }
 
   return {
     role: 'node-a',
+    scheme: externalBuffer ? 'external-bin' : scheme,
     rawBuffer,
     checksum: computeTensorChecksum(rawBuffer),
     tokEmb,
@@ -217,11 +268,12 @@ export function createShardAWeights(
 
 /**
  * Initialize Shard B (Phone 2: Layers 3..5 + Final LayerNorm + LM Head = 5,422,464 FP32 parameters)
- * Advances the PRNG past Shard A's 5,618,304 parameters so Phone 2 never allocates Shard A.
+ * Advances the PRNG past Shard A's parameters so Phone 2 never allocates Shard A.
  */
 export function createShardBWeights(
   seed = MODEL_SPEC.seed,
-  externalBuffer?: Float32Array
+  externalBuffer?: Float32Array,
+  scheme: WeightInitScheme = 'box-muller-seed42'
 ): ShardBWeights {
   const rawBuffer =
     externalBuffer && externalBuffer.length === MODEL_SPEC.shardBParams
@@ -243,22 +295,40 @@ export function createShardBWeights(
 
   if (!externalBuffer) {
     const prng = new TorchMT19937(seed);
-    // Deterministically skip Shard A's exact 5,618,304 parameters
-    prng.skipNormals(MODEL_SPEC.shardAParams);
-    initLayerWithPrng(l3.layer, prng);
-    initLayerWithPrng(l4.layer, prng);
-    initLayerWithPrng(l5.layer, prng);
-    for (let i = 0; i < MODEL_SPEC.dModel; i++) {
-      lnFWeight[i] = prng.nextNormal(1.0, 0.01);
+    if (scheme === 'pytorch-nn-default') {
+      prng.skipNormals(MODEL_SPEC.shardAPyTorchDefaultDraws);
+      initLayerWithPyTorchDefault(l3.layer, prng);
+      initLayerWithPyTorchDefault(l4.layer, prng);
+      initLayerWithPyTorchDefault(l5.layer, prng);
+      lnFWeight.fill(1.0);
+      lnFBias.fill(0.0);
+      prng.fillUniform(lmHeadWeight, 1.0 / Math.sqrt(MODEL_SPEC.dModel));
+    } else {
+      prng.skipNormals(MODEL_SPEC.shardAParams);
+      initLayerWithBoxMuller(l3.layer, prng);
+      initLayerWithBoxMuller(l4.layer, prng);
+      initLayerWithBoxMuller(l5.layer, prng);
+      for (let i = 0; i < MODEL_SPEC.dModel; i++) {
+        lnFWeight[i] = prng.nextNormal(1.0, 0.01);
+      }
+      for (let i = 0; i < MODEL_SPEC.dModel; i++) {
+        lnFBias[i] = prng.nextNormal(0.0, 0.005);
+      }
+      for (let b = 0; b < MODEL_SPEC.vocabSize; b++) {
+        const isReadableAscii =
+          b === 32 || (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+        const std = isReadableAscii ? 0.055 : 0.008;
+        const rowOffset = b * MODEL_SPEC.dModel;
+        for (let d = 0; d < MODEL_SPEC.dModel; d++) {
+          lmHeadWeight[rowOffset + d] = prng.nextNormal(0.0, std);
+        }
+      }
     }
-    for (let i = 0; i < MODEL_SPEC.dModel; i++) {
-      lnFBias[i] = prng.nextNormal(0.0, 0.005);
-    }
-    prng.fillNormal(lmHeadWeight, 0.02);
   }
 
   return {
     role: 'node-b',
+    scheme: externalBuffer ? 'external-bin' : scheme,
     rawBuffer,
     checksum: computeTensorChecksum(rawBuffer),
     layers: [l3.layer, l4.layer, l5.layer],
@@ -298,7 +368,7 @@ export function layerNormInPlace(
 }
 
 /**
- * Fast 4x-unrolled Matrix-Vector multiplication:
+ * Fast 8x-unrolled Matrix-Vector multiplication:
  * out[0..outDim-1] = weight[outDim, inDim] * input[inOffset..inOffset+inDim-1] + bias[0..outDim-1]
  */
 export function matVecMul(
@@ -315,18 +385,108 @@ export function matVecMul(
     const wRowOffset = row * inDim;
     let acc = bias ? bias[row] : 0.0;
     let col = 0;
-    const limit = inDim - 3;
-    for (; col < limit; col += 4) {
+    const limit8 = inDim - 7;
+    for (; col < limit8; col += 8) {
+      const wIdx = wRowOffset + col;
+      const xIdx = inOffset + col;
       acc +=
-        weight[wRowOffset + col] * input[inOffset + col] +
-        weight[wRowOffset + col + 1] * input[inOffset + col + 1] +
-        weight[wRowOffset + col + 2] * input[inOffset + col + 2] +
-        weight[wRowOffset + col + 3] * input[inOffset + col + 3];
+        weight[wIdx] * input[xIdx] +
+        weight[wIdx + 1] * input[xIdx + 1] +
+        weight[wIdx + 2] * input[xIdx + 2] +
+        weight[wIdx + 3] * input[xIdx + 3] +
+        weight[wIdx + 4] * input[xIdx + 4] +
+        weight[wIdx + 5] * input[xIdx + 5] +
+        weight[wIdx + 6] * input[xIdx + 6] +
+        weight[wIdx + 7] * input[xIdx + 7];
     }
     for (; col < inDim; col++) {
       acc += weight[wRowOffset + col] * input[inOffset + col];
     }
     out[outOffset + row] = Math.fround(acc);
+  }
+}
+
+/**
+ * Fused QKV Matrix-Vector Projection (8x Unrolled Register Blocking):
+ * Simultaneously computes Q, K, and V projections in a single pass over `normBuf`,
+ * reducing L1 cache reads of the input activation vector by 3x while preserving exact FP32 accumulation order.
+ */
+export function fusedQKVMatVec(
+  qOut: Float32Array,
+  kOut: Float32Array,
+  vOut: Float32Array,
+  kvOffset: number,
+  input: Float32Array,
+  layer: TransformerLayerWeights,
+  d = MODEL_SPEC.dModel
+): void {
+  const qW = layer.qWeight;
+  const qB = layer.qBias;
+  const kW = layer.kWeight;
+  const kB = layer.kBias;
+  const vW = layer.vWeight;
+  const vB = layer.vBias;
+  const limit8 = d - 7;
+
+  for (let row = 0; row < d; row++) {
+    const wRowOffset = row * d;
+    let accQ = qB[row];
+    let accK = kB[row];
+    let accV = vB[row];
+
+    let col = 0;
+    for (; col < limit8; col += 8) {
+      const wIdx = wRowOffset + col;
+      const x0 = input[col];
+      const x1 = input[col + 1];
+      const x2 = input[col + 2];
+      const x3 = input[col + 3];
+      const x4 = input[col + 4];
+      const x5 = input[col + 5];
+      const x6 = input[col + 6];
+      const x7 = input[col + 7];
+
+      accQ +=
+        qW[wIdx] * x0 +
+        qW[wIdx + 1] * x1 +
+        qW[wIdx + 2] * x2 +
+        qW[wIdx + 3] * x3 +
+        qW[wIdx + 4] * x4 +
+        qW[wIdx + 5] * x5 +
+        qW[wIdx + 6] * x6 +
+        qW[wIdx + 7] * x7;
+
+      accK +=
+        kW[wIdx] * x0 +
+        kW[wIdx + 1] * x1 +
+        kW[wIdx + 2] * x2 +
+        kW[wIdx + 3] * x3 +
+        kW[wIdx + 4] * x4 +
+        kW[wIdx + 5] * x5 +
+        kW[wIdx + 6] * x6 +
+        kW[wIdx + 7] * x7;
+
+      accV +=
+        vW[wIdx] * x0 +
+        vW[wIdx + 1] * x1 +
+        vW[wIdx + 2] * x2 +
+        vW[wIdx + 3] * x3 +
+        vW[wIdx + 4] * x4 +
+        vW[wIdx + 5] * x5 +
+        vW[wIdx + 6] * x6 +
+        vW[wIdx + 7] * x7;
+    }
+    for (; col < d; col++) {
+      const wIdx = wRowOffset + col;
+      const x = input[col];
+      accQ += qW[wIdx] * x;
+      accK += kW[wIdx] * x;
+      accV += vW[wIdx] * x;
+    }
+
+    qOut[row] = Math.fround(accQ);
+    kOut[kvOffset + row] = Math.fround(accK);
+    vOut[kvOffset + row] = Math.fround(accV);
   }
 }
 
@@ -357,8 +517,7 @@ export class TransformerShardScratch {
 
 /**
  * Execute a single Transformer Decoder block at sequence step `pos` using KV cache.
- * - `hidden`: Float32Array of length `dModel` (384) representing current token hidden state at `pos`
- * - Updates `hidden` in-place with residual connection after Attention and MLP.
+ * Supports both compiled WebAssembly (`wasm-cpu`) and 8x-unrolled JavaScript (`js-cpu`) on Web CPU.
  */
 export function runTransformerLayerStep(
   hidden: Float32Array,
@@ -366,22 +525,22 @@ export function runTransformerLayerStep(
   pos: number,
   layer: TransformerLayerWeights,
   kvCache: LayerKVCache,
-  scratch: TransformerShardScratch
+  scratch: TransformerShardScratch,
+  backend: ComputeBackend = 'wasm-cpu'
 ): void {
   const D = MODEL_SPEC.dModel; // 384
   const H = MODEL_SPEC.nHeads; // 6
   const DH = MODEL_SPEC.dHead; // 64
   const FF = MODEL_SPEC.dFf; // 1536
   const scale = 1.0 / Math.sqrt(DH); // 1 / 8 = 0.125
+  const wasm = backend === 'wasm-cpu' ? getWasmCpuKernel() : null;
 
   // 1. Pre-LayerNorm 1
   layerNormInPlace(scratch.normBuf, 0, hidden, hiddenOffset, layer.ln1Weight, layer.ln1Bias, D);
 
-  // 2. Q, K, V projections for current position `pos`
+  // 2. Fused Q, K, V projections for current position `pos` (3x fewer input activation memory reads)
   const kvOffset = pos * D;
-  matVecMul(scratch.qBuf, 0, scratch.normBuf, 0, layer.qWeight, layer.qBias, D, D);
-  matVecMul(kvCache.k, kvOffset, scratch.normBuf, 0, layer.kWeight, layer.kBias, D, D);
-  matVecMul(kvCache.v, kvOffset, scratch.normBuf, 0, layer.vWeight, layer.vBias, D, D);
+  fusedQKVMatVec(scratch.qBuf, kvCache.k, kvCache.v, kvOffset, scratch.normBuf, layer, D);
   kvCache.seqLen = pos + 1;
 
   // 3. Causal Multi-Head Self-Attention (6 heads, head_dim = 64) over positions 0..pos
@@ -394,12 +553,16 @@ export function runTransformerLayerStep(
     for (let t = 0; t <= pos; t++) {
       const kBase = t * D + headOffset;
       let dot = 0.0;
-      for (let d = 0; d < DH; d += 4) {
-        dot +=
-          scratch.qBuf[headOffset + d] * kvCache.k[kBase + d] +
-          scratch.qBuf[headOffset + d + 1] * kvCache.k[kBase + d + 1] +
-          scratch.qBuf[headOffset + d + 2] * kvCache.k[kBase + d + 2] +
-          scratch.qBuf[headOffset + d + 3] * kvCache.k[kBase + d + 3];
+      if (wasm && wasm.isSupported) {
+        dot = wasm.attentionDot64(scratch.qBuf, headOffset, kvCache.k, kBase);
+      } else {
+        for (let d = 0; d < DH; d += 4) {
+          dot +=
+            scratch.qBuf[headOffset + d] * kvCache.k[kBase + d] +
+            scratch.qBuf[headOffset + d + 1] * kvCache.k[kBase + d + 1] +
+            scratch.qBuf[headOffset + d + 2] * kvCache.k[kBase + d + 2] +
+            scratch.qBuf[headOffset + d + 3] * kvCache.k[kBase + d + 3];
+        }
       }
       const score = dot * scale;
       scratch.scoresBuf[t] = score;
@@ -452,11 +615,13 @@ export function runTransformerLayerStep(
  */
 export class NodeARuntime {
   public readonly shard: ShardAWeights;
+  public backend: ComputeBackend = 'wasm-cpu';
   private readonly kvCaches: [LayerKVCache, LayerKVCache, LayerKVCache];
   private readonly scratch = new TransformerShardScratch();
 
-  constructor(shard?: ShardAWeights) {
+  constructor(shard?: ShardAWeights, backend: ComputeBackend = 'wasm-cpu') {
     this.shard = shard ?? createShardAWeights(MODEL_SPEC.seed);
+    this.backend = backend;
     this.kvCaches = [this.createCache(), this.createCache(), this.createCache()];
   }
 
@@ -493,7 +658,15 @@ export class NodeARuntime {
     }
 
     for (let l = 0; l < 3; l++) {
-      runTransformerLayerStep(hidden, 0, pos, this.shard.layers[l], this.kvCaches[l], this.scratch);
+      runTransformerLayerStep(
+        hidden,
+        0,
+        pos,
+        this.shard.layers[l],
+        this.kvCaches[l],
+        this.scratch,
+        this.backend
+      );
     }
 
     return hidden;
@@ -531,7 +704,8 @@ export class NodeARuntime {
           pos,
           this.shard.layers[l],
           this.kvCaches[l],
-          this.scratch
+          this.scratch,
+          this.backend
         );
       }
     }
@@ -545,11 +719,13 @@ export class NodeARuntime {
  */
 export class NodeBRuntime {
   public readonly shard: ShardBWeights;
+  public backend: ComputeBackend = 'wasm-cpu';
   private readonly kvCaches: [LayerKVCache, LayerKVCache, LayerKVCache];
   private readonly scratch = new TransformerShardScratch();
 
-  constructor(shard?: ShardBWeights) {
+  constructor(shard?: ShardBWeights, backend: ComputeBackend = 'wasm-cpu') {
     this.shard = shard ?? createShardBWeights(MODEL_SPEC.seed);
+    this.backend = backend;
     this.kvCaches = [this.createCache(), this.createCache(), this.createCache()];
   }
 
@@ -581,7 +757,15 @@ export class NodeBRuntime {
     hidden.set(layer2Activation.subarray(0, D));
 
     for (let l = 0; l < 3; l++) {
-      runTransformerLayerStep(hidden, 0, pos, this.shard.layers[l], this.kvCaches[l], this.scratch);
+      runTransformerLayerStep(
+        hidden,
+        0,
+        pos,
+        this.shard.layers[l],
+        this.kvCaches[l],
+        this.scratch,
+        this.backend
+      );
     }
 
     const finalHidden = new Float32Array(D);
@@ -625,7 +809,8 @@ export class NodeBRuntime {
           pos,
           this.shard.layers[l],
           this.kvCaches[l],
-          this.scratch
+          this.scratch,
+          this.backend
         );
       }
     }
